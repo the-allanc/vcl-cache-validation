@@ -11,6 +11,8 @@ Motivation
 ----------
 The main motivation for this was to have a caching layer around an internal HTTP service we have at my employer, [YouGov][yg]. This system uses [Shoji][shoji] for object representation and manipulation. The biggest way to get performance increases for this type of system is to take advantage of caching.
 
+We want to achieve this by providing clients with a type of cache which can be used as a client-focused cache (letting the cache know what's best when it comes to returning content), but can also be used a server-side cache,
+
 [shoji]: http://www.aminus.org/rbre/shoji/shoji-draft-02.txt
 [yg]: http://www.yougov.com/
 
