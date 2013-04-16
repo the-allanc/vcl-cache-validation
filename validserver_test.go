@@ -3,28 +3,23 @@ package main
 import (
     "net/http"
     "net/http/httputil"
+    "strconv"
     "strings"
     "testing"
     "time"
 )
 
-const granularity_in_seconds = 15
+// Should be kept in sync with validserver.go.
+const granularity_in_seconds = 10
 const target_server = "http://localhost:20752"
 var client = http.Client{}
 
-/**
- * We run all tests in parallel.
- */
+// As the target server is stateful (for clock documents), add a
+// unique value to URLs on each test run.
+var seed = strconv.FormatInt(time.Now().UTC().Unix(), 16)
 
 func MakeReq(t *testing.T, url string) *http.Request {
-    // We start execution in the first five seconds of an execution
-    // loop.
-    //for {
-    //    now := time.Now().UTC()
-    //    if (now.Second() % granularity_in_seconds) < 5 {break}
-    //    time.Sleep(1 * time.Second)
-    //}
-    resp, err := http.NewRequest("GET", target_server + url, nil)
+    resp, err := http.NewRequest("GET", target_server + url + seed + "/", nil)
     if (err != nil) {
         t.Fatal("Error generating request.", err)
     }
@@ -32,7 +27,6 @@ func MakeReq(t *testing.T, url string) *http.Request {
 }
 
 func DoReq(t *testing.T, req *http.Request, expected_code int) *http.Response {
-    //t.Log("REQUEST:")
     b, err := httputil.DumpRequestOut(req, true)
     if err != nil {t.Fatal("Error dumping out request.", err)}
     t.Log("    " + strings.TrimSpace(string(b)))
@@ -40,7 +34,6 @@ func DoReq(t *testing.T, req *http.Request, expected_code int) *http.Response {
     resp, err := client.Do(req)
     if err != nil {t.Fatal("Error retrieving response.", err)}
 
-    //t.Log("RESPONSE:")
     b, err = httputil.DumpResponse(resp, true)
     if err != nil {t.Fatal("Error dumping out response.", err)}
     t.Log("    " + strings.TrimSpace(string(b)))
@@ -65,39 +58,28 @@ func CompareBodies(t *testing.T, body1 string, body2 string, same bool, identica
     line1 := strings.Split(body1, "\n")[0]
     line2 := strings.Split(body2, "\n")[0]
     if same && (line1 != line2) {
-        //t.Log("First req:")
-        //t.Log(line1)
-        //t.Log("Second req:")
-        //t.Log(line2)
         t.Fatal("First lines of requests are different, expected to be same.")    
     } else if !same && (line1 == line2) {
-        //t.Log("First line of request:")
-        //t.Log(line1)
         t.Fatal("First line of request bodies are identical, expected differences.")
     }
     if identical && (body1 != body2) {
-        //t.Log("First body:")
-        //t.Log(body1)
-        //t.Log("Second body:")
-        //t.Log(body2)
         t.Fatal("Request bodies are not the same, expected to be identical.")
     } else if !identical && (body1 == body2) {
-        //t.Log("Body:")
-        //t.Log(body1)
         t.Fatal("Request bodies are identical, expected differences.")
     }
 }
 
+// Creates validation requests based on the response.
 type Validator interface {
     Build(t *testing.T, r *http.Response) (*http.Request, *http.Request)
 }
 
+// Does something to make the document update.
 type Updater interface {
     Update(t *testing.T, r *http.Request)
 }
 
 type ETagV struct {}
-
 func (*ETagV) Build(t *testing.T, r *http.Response) (*http.Request, *http.Request) {
     modded := MakeReq(t, r.Request.URL.Path)
     same := MakeReq(t, r.Request.URL.Path)
@@ -107,7 +89,6 @@ func (*ETagV) Build(t *testing.T, r *http.Response) (*http.Request, *http.Reques
 }
 
 type DateModV struct {}
-
 func (*DateModV) Build(t *testing.T, r *http.Response) (*http.Request, *http.Request) {
     modded := MakeReq(t, r.Request.URL.Path)
     same := MakeReq(t, r.Request.URL.Path)
@@ -116,21 +97,23 @@ func (*DateModV) Build(t *testing.T, r *http.Response) (*http.Request, *http.Req
     return modded, same
 }
 
+// Clock documents - we wait a second to ensure they will end up with
+// different validators, and then do a PUT request to cause an update.
 type ClockU struct {}
 func (*ClockU) Update(t *testing.T, req *http.Request) {
-    snooze()
+    time.Sleep(time.Second)
     r := MakeReq(t, req.URL.Path)
     r.Method = "PUT"
     DoReq(t, r, 204)
 }
 
+// Periodic documents - we just wait until the document is "refreshed".
 type PeriodicU struct {}
 func (*PeriodicU) Update(t *testing.T, req *http.Request) {
-    for i:=0; i < granularity_in_seconds; i++ {
-        snooze()
-    }
+    time.Sleep(time.Second * granularity_in_seconds)
 }
 
+// Common bit of code to test validators for updateable documents.
 func DoValidationTest(t *testing.T, path string, v Validator, u Updater) {
     t.Parallel()
     
@@ -153,7 +136,7 @@ func DoValidationTest(t *testing.T, path string, v Validator, u Updater) {
     t.Log("Updating document.")
     u.Update(t, req)
     
-    // Now if we try again, the requests should behave differently.
+    // Now if we try again, the responses should indicate modification.
     t.Log("Checking document is different.")
     mresp := DoReq(t, modded, 200)
     DoReq(t, same, 412)
@@ -161,16 +144,29 @@ func DoValidationTest(t *testing.T, path string, v Validator, u Updater) {
     CompareBodies(t, body, mbody, false, false)
 }
 
-func snooze() {
-    time.Sleep(time.Second)
-}
+/**
+ * Tests.
+ */
 
+// Basic test of some functionality - handle missing documents and headers.
 func TestBasicMissingDoc(t *testing.T) {
     t.Parallel()
     req := MakeReq(t, "/gosomewhere/notexpected/")
     DoReq(t, req, 410)
 }
 
+func TestGetHeaders(t *testing.T) {
+    t.Parallel()
+    req := MakeReq(t, "/static/headers/")
+    resp := DoReq(t, req, 200)
+    
+    header := "User-Agent: Go http package"
+    if !strings.Contains(GetBody(t, resp), header) {
+        t.Fatal("Did not find expected User-Agent header.")
+    }
+}
+
+// Test that we can get a simple static response.
 func TestStaticDoc(t *testing.T) {
     t.Parallel()
     req := MakeReq(t, "/static/ourtestdoc/")
@@ -178,7 +174,7 @@ func TestStaticDoc(t *testing.T) {
     content1 := GetBody(t, resp1)
     
     // Get the document again - it should be identical.
-    snooze()
+    time.Sleep(time.Second)
     resp2 := DoReq(t, req, 200)
     content2 := GetBody(t, resp2)
     
@@ -187,6 +183,9 @@ func TestStaticDoc(t *testing.T) {
     CompareBodies(t, content1, content2, true, false)
 }
 
+/**
+ * Test different document types and different validators.
+ */
 func TestStaticEtags(t *testing.T) {
     DoValidationTest(t, "/static/etag/functest/", &ETagV{}, nil)
 }
@@ -210,5 +209,3 @@ func TestClockEtags(t *testing.T) {
 func TestClockModded(t *testing.T) {
     DoValidationTest(t, "/clock/lastmod/functest/", &DateModV{}, &ClockU{})
 }
-
-// XXX: HEADER TEST
