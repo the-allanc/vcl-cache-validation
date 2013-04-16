@@ -1,12 +1,8 @@
 /**
- * This is a webserver which generates some text indicating that the
- * response was generated a certain time, and gives the last modified
- * "date" of the content. That content is "generated" every X seconds,
- * which is defined by the granularity_in_seconds constant.
- *
- * This gives the impression that the content is being newly generated
- * every X seconds, and so means you can perform validation tests with
- * it.
+ * This is a webserver which returns virtual documents which appear to
+ * either be static, periodically updated (every X seconds), or that
+ * can be programatically updated. It performs e-tag and date modified
+ * validation.
  */
 
 package main
@@ -18,24 +14,55 @@ import (
     "sort"
     "strconv"
     "strings"
+    "sync"
     "time"
 )
 
 const granularity_in_seconds = 15
 const help_text = `
-USAGE: You can go to any URL and get some basic content.
-
-If the following components are present in the path URL, then you will
-get some additional behaviour:
-  /datemod/ -> Sets a Date-Modified header and performs date resource validation.
-  /etag/ -> Sets an E-Tag header and performs E-Tag resource validation.
-  /headers/ -> Includes the request headers in the content response.
-  /static/ -> Uses a fixed timestamp rather than an updating one.
+USAGE: You can go to any of the following URLs to get some content:
+  /static/* -> A document which appears to never update.
+  /periodic/* -> A document which updates every 15 seconds.
+  /clock/* -> A document which can be updated manually.
   
-You can combine the path components too:
-  /resource/headers/static/blahblah/etag/anythingyoulike/
+To update a document on the /clock/ resource, just send a PUT request
+(the content of which will be ignored), and it will be updated. The
+server treats each path as a unique document, so adding any of the path
+components mentioned below will be considered a different document.
+
+Documents can also output validation headers if the following components
+are present in the path:
+  /datemod/ -> Outputs a Last-Modified header, and performs date resource validation.
+               This will check If-Modified-Since and If-Unmodified-Since headers.
+  /etag/ -> Outputs an Etag header, and performs E-Tag resource validation.
+            This will check If-Match and If-None-Match headers.
+            
+If the following components are present in the path, you can get additional data.
+  /headers/ -> Outputs the request headers in the response.
+
+So to access a document which appears to update every 15 seconds, and
+to output an Etag header, and include request headers:
+  /periodic/etag/headers/hamster/slipper/
 `
 
+// We record old responses for the test suite.
+type HistoricResponse struct {
+    Code int
+    Body string
+}
+
+var last_responses = make(map[string]HistoricResponse)
+
+// This is where we store our clocked documents.
+var dynamic_docs = make(map[string]time.Time)
+var our_mutex = sync.Mutex{}
+
+/**
+ * This is a quickly put together bit of code "wot I wrote" which
+ * emulates Python's StringIO (or Java's ByteWriter) such that we
+ * can compose a response by writing to a buffer and then determine
+ * the correct Content-Length header at the end.
+ */
 type ByteWriter struct {
     buf []byte
     pos int
@@ -59,14 +86,59 @@ func (b *ByteWriter) AsString() string {
     return string(b.buf[0:b.pos]);
 }
 
+/**
+ * Handler function for the server.
+ */
 func handle(w http.ResponseWriter, r *http.Request) {
 
+    /**
+     * This is the function where we write out a response, set the
+     * right headers, set the content length etc. All the logic later
+     * on in the code should call this function and return.
+     */
     respond := func (code int, message string) {
         timestamp := time.Now().Format("[2006/01/02 15:04:05]")
         fmt.Println(timestamp, r.Method, r.URL, "->", code)
-        if (message != "") {
-            http.Error(w, message, code)
+        
+        /**
+         * http.Error will set a Content-Type. Even for 304's. That's
+         * fine. And then when writing out the response, it'll complain
+         * that the header is there. Nice.
+         * 
+         * That's why I stopped using http.Error and instead just avoid
+         * writing out those headers if there's no response content.
+         * Make sure that any 304's returned will not pass a message!
+         */
+        if len(message) > 0 {
+            w.Header().Set("Content-Length", strconv.Itoa(len(message)))
+            w.Header().Set("Content-Type", "text/plain; charset=utf-8")
         }
+        w.WriteHeader(code)
+        fmt.Fprint(w, message)
+
+        // Cache this response for test inspection.        
+        our_mutex.Lock()
+        defer our_mutex.Unlock()
+        if r.Method == "GET" && len(r.URL.RawQuery) == 0 {
+            last_responses[r.URL.Path] = HistoricResponse{code, message}
+        }
+    }
+    
+    // All URLs have to have forward slashes at the end!
+    if !strings.HasSuffix(r.URL.Path, "/") {
+        respond(410, "You must have a forward slash at the end of the path.")
+        return
+    }
+    
+    now := time.Now().UTC()
+    
+    // Here's where we update clock documents.
+    if r.Method == "PUT" && strings.HasPrefix(r.URL.Path, "/clock/") {
+        our_mutex.Lock()
+        dynamic_docs[r.URL.Path] = now
+        our_mutex.Unlock()
+        respond(204, "")
+        return
     }
 
     // Only GET allowed.
@@ -75,20 +147,59 @@ func handle(w http.ResponseWriter, r *http.Request) {
         return
     }
     
+    // If there's a query string argument of lastresp=yes, we
+    // "reproduce" the content without the original headers.
+    if r.URL.Query().Get("lastresp") == "yes" {
+        our_mutex.Lock()
+        lastresp, has_it := last_responses[r.URL.Path]
+        our_mutex.Unlock()
+        
+        if !has_it {
+            respond(404, "No previous response available.")
+            return
+        }
+
+        // Write out the previous body. We won't cache the response,
+        // because there's a query string place.
+        respond(lastresp.Code, lastresp.Body)
+        return
+    }
+    
+    // Print help text on the root resource.
+    if r.URL.Path == "/" {
+        respond(200, help_text)
+        return
+    }
+    
     // Determine what things we want to do for our response.
     print_headers := strings.Index(r.URL.Path, "/headers/") != -1
     use_etags := strings.Index(r.URL.Path, "/etag/") != -1
     use_lastmod := strings.Index(r.URL.Path, "/lastmod/") != -1
-    be_static := strings.Index(r.URL.Path, "/static/") != -1
-    
+
     // This is the content.
-    now := time.Now().UTC()
-    now_header := now.Format(time.RFC1123Z)
-    seconds := ((now.Second() / granularity_in_seconds) * granularity_in_seconds)
-    then := time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), seconds, 0, now.Location())
-    if be_static {
+    var then time.Time;
+    if strings.HasPrefix(r.URL.Path, "/static/") {
         then = time.Date(2012, 12, 20, 20, 12, 12, 0, now.Location())
+    } else if strings.HasPrefix(r.URL.Path, "/periodic/") {
+        seconds := ((now.Second() / granularity_in_seconds) * granularity_in_seconds)
+        then = time.Date(now.Year(), now.Month(), now.Day(), now.Hour(), now.Minute(), seconds, 0, now.Location())
+    } else if strings.HasPrefix(r.URL.Path, "/clock/") {
+        our_mutex.Lock()
+        var has_time bool
+        
+        // Get the dynamic document.
+        then, has_time = dynamic_docs[r.URL.Path]
+        
+        // But if one isn't there, create it now.
+        if (!has_time) {then = now}
+        dynamic_docs[r.URL.Path] = then
+        our_mutex.Unlock()
+    } else {
+        respond(410, "No handler defined here.")
+        return
     }
+    
+    now_header := now.Format(time.RFC1123Z)
     then_header := then.Format(time.RFC1123Z)
 
     // Custom headers for the response.
@@ -116,11 +227,11 @@ func handle(w http.ResponseWriter, r *http.Request) {
         etag_if_none_match := r.Header.Get("If-None-Match")
         if (len(etag_if_none_match) > 0) && (
             etag_enc == "\"*\"" || etag_enc == etag_if_none_match) {
-            respond(304, "Content matches on If-None-Match")
+            respond(304, "")
             return
         }
         
-        headers["E-Tag"] = etag_enc
+        headers["Etag"] = etag_enc
     }
 
     // Last modified check, based on the method "validate_since" in
@@ -136,21 +247,13 @@ func handle(w http.ResponseWriter, r *http.Request) {
 
         // Check If-Modified-Since header.
         mod_since := r.Header.Get("If-Modified-Since")
-        if (len(mod_since) > 0) && (mod_since != then_header) {
-            respond(304, "Document has not been modified")
+        if (len(mod_since) > 0) && (mod_since == then_header) {
+            respond(304, "")
             return
         }
         
         headers["Last-Modified"] = then_header
-
-    }
-    
-    w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-    if r.URL.Path == "/" {
-        w.Header().Set("Content-Length", strconv.Itoa(len(help_text)))
-        fmt.Fprint(w, help_text)
-        return
-    }
+    }    
 
     /**
      * Response-writing time! We write in a buffer because we want to
@@ -162,6 +265,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
     fmt.Fprintln(b, "Content date:", then_header)
     fmt.Fprintln(b, "Generated:   ", now_header)
 
+    // Add request headers to the response.
     if (print_headers) {
         fmt.Fprintln(b, "\nREQUEST HEADERS:")
         keys := make([]string, 0, len(r.Header))
@@ -181,9 +285,7 @@ func handle(w http.ResponseWriter, r *http.Request) {
     
     // Write out buffered content.
     content := b.AsString()
-    w.Header().Set("Content-Length", strconv.Itoa(len(content)))
-    respond(200, "")
-    fmt.Fprint(w, content)
+    respond(200, content) // Won't actually write out the response!
     return
 }
 
