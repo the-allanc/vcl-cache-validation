@@ -18,11 +18,11 @@ import (
     "time"
 )
 
-const granularity_in_seconds = 15
+const granularity_in_seconds = 10
 const help_text = `
 USAGE: You can go to any of the following URLs to get some content:
   /static/* -> A document which appears to never update.
-  /periodic/* -> A document which updates every 15 seconds.
+  /periodic/* -> A document which updates every 10 seconds.
   /clock/* -> A document which can be updated manually.
   
 To update a document on the /clock/ resource, just send a PUT request
@@ -40,7 +40,7 @@ are present in the path:
 If the following components are present in the path, you can get additional data.
   /headers/ -> Outputs the request headers in the response.
 
-So to access a document which appears to update every 15 seconds, and
+So to access a document which appears to update every 10 seconds, and
 to output an Etag header, and include request headers:
   /periodic/etag/headers/hamster/slipper/
 `
